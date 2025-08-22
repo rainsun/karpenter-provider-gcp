@@ -36,7 +36,7 @@ import (
 )
 
 func NewInstanceType(ctx context.Context, mt *computepb.MachineType,
-	region string, offerings cloudprovider.Offerings) *cloudprovider.InstanceType {
+	region string, offerings cloudprovider.Offerings, nodeClass *v1alpha1.GCENodeClass) *cloudprovider.InstanceType {
 	if offerings == nil {
 		return nil
 	}
@@ -57,7 +57,7 @@ func NewInstanceType(ctx context.Context, mt *computepb.MachineType,
 		Name:         aws.StringValue(mt.Name),
 		Requirements: computeRequirements(mt, offerings, region),
 		Offerings:    offerings,
-		Capacity:     computeCapacity(ctx, mt),
+		Capacity:     computeCapacity(ctx, mt, nodeClass),
 		Overhead:     &overhead,
 	}
 
@@ -163,11 +163,12 @@ func extractArch(instanceTypePrefix string) string {
 	return "amd64"
 }
 
-func computeCapacity(ctx context.Context, mt *computepb.MachineType) corev1.ResourceList {
+func computeCapacity(ctx context.Context, mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass) corev1.ResourceList {
 	resourceList := corev1.ResourceList{
-		corev1.ResourceCPU:    *cpu(mt),
-		corev1.ResourceMemory: *memory(ctx, mt),
-		corev1.ResourcePods:   *resource.NewQuantity(int64(v1alpha1.KubeletMaxPods), resource.DecimalSI),
+		corev1.ResourceCPU:              *cpu(mt),
+		corev1.ResourceMemory:           *memory(ctx, mt),
+		corev1.ResourceEphemeralStorage: *ephemeralStorage(ctx, mt, nodeClass),
+		corev1.ResourcePods:             *maxPods(nodeClass),
 	}
 	return resourceList
 }
@@ -180,4 +181,151 @@ func memory(ctx context.Context, mt *computepb.MachineType) *resource.Quantity {
 	osReservedPercent := options.FromContext(ctx).VMMemoryOverheadPercent
 	totalQuantity := int64(mt.GetMemoryMb()) * 1024 * 1024
 	return resource.NewQuantity(totalQuantity-int64(float64(totalQuantity)*osReservedPercent), resource.DecimalSI)
+}
+
+// ephemeralStorage calculates the available ephemeral storage for the instance type
+// This includes boot disk space minus OS and system reserved space
+//
+// CURRENT SCOPE: Boot disk ephemeral storage only
+// - Calculates based on boot disk size (explicit config or 100GB GCP default)
+// - Applies unified 50GB system reservation for all OS types
+// - Local SSD support is planned for future enhancement
+func ephemeralStorage(ctx context.Context, mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass) *resource.Quantity {
+	// Get boot disk size using layered default strategy
+	bootDiskSizeGiB := getBootDiskSize(nodeClass)
+	
+	// Add Local SSD storage if the instance type supports it
+	// TODO: Currently always returns 0 - see getLocalSSDStorage() comments
+	instanceTypeName := aws.StringValue(mt.Name)
+	localSSDSizeGiB := getLocalSSDStorage(instanceTypeName)
+	totalStorageGiB := bootDiskSizeGiB + localSSDSizeGiB
+	
+	// Calculate system reserved space
+	// NOTE: Currently uses unified reservation logic for all OS types, but we still
+	// pass nodeClass for potential future OS-specific optimizations if real-world
+	// data suggests different reservation needs
+	osReservedGiB := calculateSystemReserved(nodeClass, totalStorageGiB)
+	
+	// Calculate available ephemeral storage
+	availableStorageGiB := totalStorageGiB - osReservedGiB
+	
+	// Ensure we have at least 1GB available
+	if availableStorageGiB < 1 {
+		availableStorageGiB = 1
+	}
+	
+	// Convert to bytes
+	availableStorageBytes := availableStorageGiB * 1024 * 1024 * 1024
+	return resource.NewQuantity(availableStorageBytes, resource.BinarySI)
+}
+
+// getBootDiskSize returns the boot disk size using a layered default strategy
+// Priority: explicit boot disk > first disk > global default (100GB as per GCP specification)
+func getBootDiskSize(nodeClass *v1alpha1.GCENodeClass) int64 {
+	// Global default boot disk size - matches GCP/GKE official default for all image families
+	// Reference: https://cloud.google.com/kubernetes-engine/docs/concepts/node-images
+	// "If unspecified, the default disk size is 100GB"
+	defaultBootDiskSizeGiB := int64(100)
+	
+	if nodeClass == nil {
+		return defaultBootDiskSizeGiB
+	}
+	
+	// Priority 1: Look for explicitly marked boot disk
+	if len(nodeClass.Spec.Disks) > 0 {
+		for _, disk := range nodeClass.Spec.Disks {
+			if disk.Boot {
+				return int64(disk.SizeGiB)
+			}
+		}
+		
+		// Priority 2: If no boot disk is explicitly marked, use the first disk
+		return int64(nodeClass.Spec.Disks[0].SizeGiB)
+	}
+	
+	// Priority 3: Use GCP's unified default (100GB) for all image families
+	// GCP has already sized this to accommodate all supported operating systems
+	return defaultBootDiskSizeGiB
+}
+
+// getLocalSSDStorage returns the Local SSD storage size in GiB for instance types that support it
+// Currently returns 0 (no Local SSD support) to focus on core boot disk functionality.
+func getLocalSSDStorage(instanceTypeName string) int64 {
+	return 0
+}
+
+// calculateSystemReserved calculates the amount of storage to reserve for OS and Kubernetes components
+func calculateSystemReserved(nodeClass *v1alpha1.GCENodeClass, totalStorageGiB int64) int64 {
+	// Priority 1: Check if user explicitly configured ephemeral-storage reservation
+	if nodeClass != nil && nodeClass.Spec.KubeletConfiguration != nil {
+		// Check SystemReserved first (OS system daemons and kernel memory)
+		if systemReserved, exists := nodeClass.Spec.KubeletConfiguration.SystemReserved["ephemeral-storage"]; exists {
+			if reservedGiB, err := parseStorageQuantity(systemReserved); err == nil {
+				// Convert to GiB and ensure it doesn't exceed total storage
+				if reservedGiB <= totalStorageGiB {
+					return reservedGiB
+				}
+				// If configured value exceeds total, cap it at total storage
+				return totalStorageGiB
+			}
+		}
+		
+		// Check KubeReserved (Kubernetes system components)
+		if kubeReserved, exists := nodeClass.Spec.KubeletConfiguration.KubeReserved["ephemeral-storage"]; exists {
+			if reservedGiB, err := parseStorageQuantity(kubeReserved); err == nil {
+				// Convert to GiB and ensure it doesn't exceed total storage
+				if reservedGiB <= totalStorageGiB {
+					return reservedGiB
+				}
+				// If configured value exceeds total, cap it at total storage
+				return totalStorageGiB
+			}
+		}
+	}
+	
+	// Priority 2: Fall back to unified 50GB reservation strategy
+	// This is our default approach when no explicit configuration is provided
+	// Based on real GKE observations showing ~52GB reservation on 100GB disks
+	defaultReservedGiB := int64(50)
+	
+	// For very small disks, ensure we don't reserve more than available
+	if totalStorageGiB <= defaultReservedGiB {
+		// Reserve at most 80% of small disks to ensure some usable space
+		reservedGiB := totalStorageGiB * 80 / 100
+		// But ensure minimum 5GB reservation for system stability
+		if reservedGiB < 5 {
+			reservedGiB = 5
+		}
+		return reservedGiB
+	}
+	
+	return defaultReservedGiB
+}
+
+// parseStorageQuantity parses a Kubernetes resource quantity string and returns the value in GiB
+// Supports formats like "50Gi", "51200Mi", "100G", etc.
+func parseStorageQuantity(quantityStr string) (int64, error) {
+	quantity, err := resource.ParseQuantity(quantityStr)
+	if err != nil {
+		return 0, err
+	}
+	
+	// Convert to bytes first, then to GiB
+	bytes := quantity.Value()
+	giB := bytes / (1024 * 1024 * 1024)
+	
+	return giB, nil
+}
+
+// maxPods returns the maximum number of pods that can run on the node
+// Priority: nodeclass MaxPods configuration > default KubeletMaxPods value
+func maxPods(nodeClass *v1alpha1.GCENodeClass) *resource.Quantity {
+	// Priority 1: Check if user explicitly configured MaxPods in KubeletConfiguration
+	if nodeClass != nil && nodeClass.Spec.KubeletConfiguration != nil && nodeClass.Spec.KubeletConfiguration.MaxPods != nil {
+		return resource.NewQuantity(int64(*nodeClass.Spec.KubeletConfiguration.MaxPods), resource.DecimalSI)
+	}
+	
+	// Priority 2: Fall back to default maximum pods value
+	// This is the standard maximum pods per node for GCP instances
+	return resource.NewQuantity(int64(v1alpha1.KubeletMaxPods), resource.DecimalSI)
 }
