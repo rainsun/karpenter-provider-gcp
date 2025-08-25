@@ -432,6 +432,9 @@ func (p *DefaultProvider) buildInstance(nodeClaim *karpv1.NodeClaim, nodeClass *
 		serviceAccounts = []*compute.ServiceAccount{
 			&compute.ServiceAccount{
 				Email: serviceAccount,
+				Scopes: []string{
+					"https://www.googleapis.com/auth/cloud-platform",
+				},
 			},
 		}
 	}
